@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>BelleVie Voice Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 40px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h2 { color: #2c3e50; }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        #startBtn { background: #27ae60; color: white; }
+        #startBtn:disabled { background: #95a5a6; cursor: not-allowed; }
+        #endBtn { background: #e74c3c; color: white; }
+        #endBtn:disabled { background: #95a5a6; cursor: not-allowed; }
+        #status {
+            margin-top: 20px;
+            padding: 12px;
+            background: white;
+            border-radius: 8px;
+            border-left: 4px solid #3498db;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        #transcript, #response {
+            margin-top: 12px;
+            padding: 12px;
+            background: white;
+            border-radius: 8px;
+            min-height: 40px;
+            color: #555;
+        }
+        #transcript { border-left: 4px solid #e67e22; }
+        #response   { border-left: 4px solid #27ae60; }
+        label { font-size: 13px; color: #777; display: block; margin-bottom: 4px; }
+    </style>
+</head>
+<body>
+    <h2>BelleVie Voice Call Test</h2>
+
+    <button id="startBtn">📞 Start Call</button>
+    <button id="endBtn" disabled>📵 End Call</button>
+
+    <div id="status">Ready — click Start Call</div>
+
+    <label style="margin-top:16px">You said:</label>
+    <div id="transcript">—</div>
+
+    <label>BelleVie AI:</label>
+    <div id="response">—</div>
+
+    <script>
+        // ── Config ──────────────────────────────────────────
+        const SERVER_URL = "http://localhost:8010";   // change to your ngrok or server URL
+        const SESSION_ID = "voice-test-" + Date.now();
+        const WS_URL     = SERVER_URL.replace("http://", "ws://")
+                                     .replace("https://", "wss://")
+                           + "/ws/voice/" + SESSION_ID;
+
+        // ── State ───────────────────────────────────────────
+        let ws            = null;
+        let mediaStream   = null;
+        let audioContext  = null;
+        let sourceNode    = null;
+        let processorNode = null;
+
+        function log(msg) {
+            console.log("[BelleVie Voice]", msg);
+        }
+
+        function setStatus(msg) {
+            document.getElementById("status").innerText = msg;
+            log(msg);
+        }
+
+        // ── Mic control ─────────────────────────────────────
+        // Physically disconnect processor to stop sending audio
+        function disconnectMic() {
+            if (processorNode && sourceNode) {
+                try {
+                    sourceNode.disconnect(processorNode);
+                    processorNode.disconnect(audioContext.destination);
+                } catch (e) {}
+                processorNode = null;
+                sourceNode    = null;
+                log("🔇 Microphone disconnected");
+            }
+        }
+
+        // Reconnect processor to resume sending audio
+        function reconnectMic() {
+            if (!mediaStream || !audioContext || processorNode) return;
+
+            sourceNode    = audioContext.createMediaStreamSource(mediaStream);
+            processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+
+            let chunkCount = 0;
+            processorNode.onaudioprocess = (e) => {
+                if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+                const float32 = e.inputBuffer.getChannelData(0);
+                const int16   = new Int16Array(float32.length);
+                for (let i = 0; i < float32.length; i++) {
+                    int16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
+                }
+                ws.send(int16.buffer);
+
+                chunkCount++;
+                if (chunkCount % 20 === 0) {
+                    log(`🎤 Sent ${chunkCount} audio chunks`);
+                }
+            };
+
+            sourceNode.connect(processorNode);
+            processorNode.connect(audioContext.destination);
+            log("🎤 Microphone connected");
+        }
+
+        // ── Start microphone ─────────────────────────────────
+        async function startMicrophone() {
+            log("Requesting microphone access...");
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                log(`Microphone granted — tracks: ${mediaStream.getAudioTracks().length}`);
+            } catch (err) {
+                setStatus("❌ Microphone access denied — please allow mic and refresh");
+                log("Mic error: " + err);
+                return false;
+            }
+
+            audioContext = new AudioContext({ sampleRate: 16000 });
+
+            if (audioContext.state === "suspended") {
+                log("AudioContext suspended — resuming...");
+                await audioContext.resume();
+            }
+            log(`AudioContext state: ${audioContext.state}`);
+
+            // Don't connect mic yet — server will send unmute after greeting
+            log("Microphone ready — waiting for server unmute");
+            return true;
+        }
+
+        // ── Play audio response ──────────────────────────────
+        async function playAudio(arrayBuffer) {
+            log(`Playing audio response (${arrayBuffer.byteLength} bytes)`);
+            try {
+                const playCtx = new AudioContext();
+                const decoded = await playCtx.decodeAudioData(arrayBuffer);
+                const source  = playCtx.createBufferSource();
+                source.buffer = decoded;
+                source.connect(playCtx.destination);
+
+                source.onended = () => {
+                    log("Audio playback finished — sending ack");
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: "audio_played" }));
+                    }
+                };
+
+                source.start();
+            } catch (err) {
+                log("Audio playback error: " + err);
+                // Send ack anyway so the call doesn't hang
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: "audio_played" }));
+                }
+            }
+        }
+
+        // ── Handle messages from server ──────────────────────
+        async function handleMessage(event) {
+            // Binary = audio response
+            if (event.data instanceof ArrayBuffer) {
+                await playAudio(event.data);
+                return;
+            }
+
+            // JSON = status/control message
+            try {
+                const data = JSON.parse(event.data);
+                log(`JSON received: ${data.type} — ${data.message || data.text || ""}`);
+
+                switch (data.type) {
+                    case "call_started":
+                        setStatus("🔔 " + data.message);
+                        break;
+
+                    case "mute":
+                        disconnectMic();   // physically stop sending audio
+                        setStatus("🔇 Muted — AI is speaking...");
+                        break;
+
+                    case "unmute":
+                        reconnectMic();    // physically resume sending audio
+                        setStatus("🎤 Listening...");
+                        break;
+
+                    case "listening":
+                        setStatus("🎤 " + (data.message || "Listening..."));
+                        break;
+
+                    case "processing":
+                        setStatus("⚙️ " + (data.message || "Processing..."));
+                        break;
+
+                    case "transcript":
+                        document.getElementById("transcript").innerText = data.text;
+                        break;
+
+                    case "response_text":
+                        document.getElementById("response").innerText = data.text;
+                        setStatus("🔊 AI Speaking...");
+                        break;
+
+                    case "error":
+                        setStatus("⚠️ " + data.message);
+                        break;
+
+                    default:
+                        log("Unknown message type: " + data.type);
+                }
+            } catch (e) {
+                log("Failed to parse JSON: " + e);
+            }
+        }
+
+        // ── Start call ───────────────────────────────────────
+        document.getElementById("startBtn").onclick = async () => {
+            document.getElementById("startBtn").disabled = true;
+            document.getElementById("endBtn").disabled   = false;
+            document.getElementById("transcript").innerText = "—";
+            document.getElementById("response").innerText   = "—";
+
+            setStatus("🔌 Connecting...");
+
+            const micReady = await startMicrophone();
+            if (!micReady) {
+                document.getElementById("startBtn").disabled = false;
+                document.getElementById("endBtn").disabled   = true;
+                return;
+            }
+
+            ws = new WebSocket(WS_URL);
+            ws.binaryType = "arraybuffer";
+
+            ws.onopen = () => {
+                log("WebSocket connected");
+                setStatus("🔌 Connected — waiting for greeting...");
+            };
+
+            ws.onmessage = handleMessage;
+
+            ws.onerror = (e) => {
+                log("WebSocket error: " + e);
+                setStatus("❌ Connection error — check server is running");
+            };
+
+            ws.onclose = () => {
+                log("WebSocket closed");
+                disconnectMic();
+                document.getElementById("startBtn").disabled = false;
+                document.getElementById("endBtn").disabled   = true;
+                setStatus("📵 Call ended");
+            };
+        };
+
+        // ── End call ─────────────────────────────────────────
+        document.getElementById("endBtn").onclick = () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send("END_CALL");
+            }
+            disconnectMic();
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(t => t.stop());
+                mediaStream = null;
+            }
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            document.getElementById("startBtn").disabled = false;
+            document.getElementById("endBtn").disabled   = true;
+            setStatus("📵 Call ended");
+        };
+    </script>
+</body>
+</html>

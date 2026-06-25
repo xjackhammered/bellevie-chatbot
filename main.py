@@ -155,13 +155,14 @@ def build_context(docs: list) -> str:
 def chat_pipeline(
     user_message: str,
     conversation_history: list,
-    max_tokens: int = 600      # text=600, voice=200
+    max_tokens: int = 600
 ) -> tuple:
     """
     Core RAG logic shared by both /chat and /ws/voice.
     max_tokens controls response length:
       - 600 for text chat (full detailed responses)
-      - 200 for voice calls (short spoken responses)
+      - 400 for voice calls (detailed but speakable)
+    Returns: (response_text, conversation_history, model_used)
     """
 
     # Step 1 — Language detection and translation
@@ -173,8 +174,7 @@ def chat_pipeline(
     context = build_context(docs)
 
     # Step 3 — Build messages
-    voice_note = " Keep response under 3 sentences — this is a voice call." if max_tokens == 200 else ""
-
+    # No voice_note — system prompt already handles conciseness (Rule 8)
     messages = [
         {
             "role":    "system",
@@ -184,7 +184,7 @@ def chat_pipeline(
     messages += conversation_history[-4:]
     messages.append({
         "role":    "user",
-        "content": f"[Respond in {lang} only.{voice_note}]\n\n{user_message}"
+        "content": f"[Respond in {lang} only.]\n\n{user_message}"
     })
 
     # Step 4 — Model cascade
@@ -224,7 +224,7 @@ def chat_pipeline(
     conversation_history.append({"role": "user",      "content": user_message})
     conversation_history.append({"role": "assistant", "content": assistant_message})
 
-    return assistant_message, conversation_history
+    return assistant_message, conversation_history, model_used   # ← 3 values now
 
 # ── Routes ────────────────────────────────────────────────────
 @app.get("/")
@@ -248,20 +248,18 @@ def chat_endpoint(request: ChatRequest):
     if request.session_id not in sessions:
         sessions[request.session_id] = []
 
-    # Text chat uses max_tokens=600 for full detailed responses
-    response_text, sessions[request.session_id] = chat_pipeline(
+    response_text, sessions[request.session_id], actual_model = chat_pipeline(
         request.message,
         sessions[request.session_id],
         max_tokens=600
     )
 
-    # Keep last 20 turns per session
     sessions[request.session_id] = sessions[request.session_id][-20:]
 
     return ChatResponse(
         response=response_text,
         session_id=request.session_id,
-        model_used=LLM_MODEL
+        model_used=actual_model   # now shows real model used
     )
 
 @app.delete("/session/{session_id}")

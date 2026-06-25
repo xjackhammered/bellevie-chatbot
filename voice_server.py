@@ -84,9 +84,9 @@ def is_speech(frame: bytes) -> bool:
     except:
         return False
 
-# ── Helper: wait for client ack (only used for main responses) ─
+# ── Helper: wait for client ack ───────────────────────────────
 async def _wait_for_ack(ws, session_id):
-    """Wait until client sends 'audio_played' JSON message."""
+    """Wait until client sends audio_played JSON message."""
     while True:
         data = await ws.receive()
         if "text" in data:
@@ -123,9 +123,11 @@ async def handle_voice_call(
         if greeting_audio:
             await websocket.send_json({"type": "mute"})
             await websocket.send_bytes(greeting_audio)
-            await asyncio.sleep(2)   # allow greeting to play out
+            await asyncio.sleep(2)        # let greeting play out
+            await asyncio.sleep(0.3)      # guard period before unmuting
             await websocket.send_json({"type": "unmute"})
             await websocket.send_json({"type": "listening", "message": "Listening..."})
+
     except WebSocketDisconnect:
         print(f"📵 Client disconnected during greeting: {session_id}")
         return
@@ -155,9 +157,9 @@ async def handle_voice_call(
                     if goodbye_audio:
                         await websocket.send_json({"type": "mute"})
                         await websocket.send_bytes(goodbye_audio)
-                        await asyncio.sleep(2)  # simple delay for goodbye
+                        await asyncio.sleep(2)
                     break
-                # Ignore any other text (including spurious audio_played)
+                # Ignore spurious audio_played in listening state
                 try:
                     msg = json.loads(text_data)
                     if msg.get("type") == "audio_played":
@@ -166,7 +168,7 @@ async def handle_voice_call(
                     pass
                 continue
 
-            # Audio bytes
+            # Audio bytes — skip if muted
             chunk = data.get("bytes", b"")
             if not chunk or muted:
                 continue
@@ -191,11 +193,11 @@ async def handle_voice_call(
                         silence_count += 1
                         speech_buffer += frame
 
-                # Silence threshold reached
+                # Silence threshold reached — user finished speaking
                 if speech_detected and silence_count >= SILENCE_THRESHOLD:
                     print(f"⏸️ Processing speech: {session_id}")
 
-                    # Mute immediately
+                    # Immediately mute — stop accepting audio
                     await websocket.send_json({"type": "mute"})
                     muted = True
 
@@ -210,7 +212,8 @@ async def handle_voice_call(
                     speech_detected = False
                     silence_count   = 0
 
-                    if len(full_audio) < SAMPLE_RATE:
+                    # Skip if audio too short (under 0.5s)
+                    if len(full_audio) < SAMPLE_RATE // 2:
                         await websocket.send_json({
                             "type":    "listening",
                             "message": "Listening..."
@@ -221,6 +224,7 @@ async def handle_voice_call(
 
                     # ── STT ───────────────────────────────
                     transcript = await transcribe_audio(full_audio)
+
                     if not transcript.strip():
                         await websocket.send_json({
                             "type":    "listening",
@@ -230,25 +234,38 @@ async def handle_voice_call(
                         muted = False
                         continue
 
-                    await websocket.send_json({"type": "transcript", "text": transcript})
+                    await websocket.send_json({
+                        "type": "transcript",
+                        "text": transcript
+                    })
 
-                    # ── RAG ───────────────────────────────
+                    # ── RAG (voice uses max_tokens=400 for detailed responses) ──
                     if session_id not in sessions:
                         sessions[session_id] = []
 
-                    response_text, sessions[session_id] = chat_pipeline(
-                        transcript, sessions[session_id], max_tokens=200
+                    # chat_pipeline returns (response, history, model_used)
+                    response_text, sessions[session_id], model_used = chat_pipeline(
+                        transcript,
+                        sessions[session_id],
+                        max_tokens=400
                     )
-                    print(f"🤖 Response: {response_text[:80]}...")
+                    print(f"🤖 [{model_used}] Response: {response_text[:80]}...")
 
-                    await websocket.send_json({"type": "response_text", "text": response_text})
+                    await websocket.send_json({
+                        "type": "response_text",
+                        "text": response_text
+                    })
 
-                    # ── TTS (with ack to prevent echo) ────
+                    # ── TTS ───────────────────────────────
                     audio_response = await text_to_speech_audio(response_text)
+
                     if audio_response:
+                        # Mic already muted — send audio
                         await websocket.send_bytes(audio_response)
-                        # Wait for client to finish playback before unmuting
+                        # Wait for client to confirm playback finished
                         await _wait_for_ack(websocket, session_id)
+                        # Short guard before reopening mic
+                        await asyncio.sleep(0.3)
                         await websocket.send_json({"type": "unmute"})
                         muted = False
                     else:
