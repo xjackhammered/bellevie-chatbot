@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-dotenv
+chromadb
+sentence-transformers
+groq
+edge-tts
+webrtcvad
+numpy==1.26.4
