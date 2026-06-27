@@ -23,13 +23,13 @@ CHROMA_DIR      = os.getenv('CHROMA_DIR', './chroma_db')
 EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
 TOP_K_RETRIEVAL = 4
 
-LLM_MODEL     = 'llama-3.3-70b-versatile'
+# ── Model cascade (updated June 2026) ─────────────────────────
+LLM_MODEL     = 'llama-3.3-70b-versatile'   # primary — 100k tokens/day free
 LLM_FALLBACKS = [
-    'gemma2-9b-it',
-    'mixtral-8x7b-32768',
-    'llama-3.1-8b-instant',
+    'mixtral-8x7b-32768',                    # fallback 1 — 500k tokens/day free
+    'openai/gpt-oss-20b',                    # fallback 2 — 200k tokens/day free
 ]
-TRANSLATE_MODEL = 'llama-3.1-8b-instant'
+TRANSLATE_MODEL = 'openai/gpt-oss-20b'      # replaces deprecated llama-3.1-8b-instant
 
 # ── Load on startup ───────────────────────────────────────────
 print("Loading embedding model...")
@@ -159,9 +159,6 @@ def chat_pipeline(
 ) -> tuple:
     """
     Core RAG logic shared by both /chat and /ws/voice.
-    max_tokens controls response length:
-      - 600 for text chat (full detailed responses)
-      - 400 for voice calls (detailed but speakable)
     Returns: (response_text, conversation_history, model_used)
     """
 
@@ -174,7 +171,6 @@ def chat_pipeline(
     context = build_context(docs)
 
     # Step 3 — Build messages
-    # No voice_note — system prompt already handles conciseness (Rule 8)
     messages = [
         {
             "role":    "system",
@@ -224,7 +220,7 @@ def chat_pipeline(
     conversation_history.append({"role": "user",      "content": user_message})
     conversation_history.append({"role": "assistant", "content": assistant_message})
 
-    return assistant_message, conversation_history, model_used   # ← 3 values now
+    return assistant_message, conversation_history, model_used
 
 # ── Routes ────────────────────────────────────────────────────
 @app.get("/")
@@ -259,7 +255,7 @@ def chat_endpoint(request: ChatRequest):
     return ChatResponse(
         response=response_text,
         session_id=request.session_id,
-        model_used=actual_model   # now shows real model used
+        model_used=actual_model
     )
 
 @app.delete("/session/{session_id}")
@@ -271,11 +267,6 @@ def clear_session(session_id: str):
 # ── Voice WebSocket ───────────────────────────────────────────
 @app.websocket("/ws/voice/{session_id}")
 async def voice_websocket(websocket: WebSocket, session_id: str):
-    """
-    WebSocket endpoint for live voice calls.
-    Flutter connects here for AI voice conversation.
-    URL: ws://66.29.151.40:8010/ws/voice/{session_id}
-    """
     await handle_voice_call(
         websocket=websocket,
         session_id=session_id,
