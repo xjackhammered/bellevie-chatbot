@@ -23,13 +23,13 @@ CHROMA_DIR      = os.getenv('CHROMA_DIR', './chroma_db')
 EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
 TOP_K_RETRIEVAL = 4
 
-# ── Model cascade (updated June 2026) ─────────────────────────
-LLM_MODEL     = 'llama-3.3-70b-versatile'   # primary — 100k tokens/day free
+# ── Model cascade ─────────────────────────────────────────────
+LLM_MODEL     = 'llama-3.3-70b-versatile'
 LLM_FALLBACKS = [
-    'mixtral-8x7b-32768',                    # fallback 1 — 500k tokens/day free
-    'openai/gpt-oss-20b',                    # fallback 2 — 200k tokens/day free
+    'mixtral-8x7b-32768',
+    'openai/gpt-oss-20b',
 ]
-TRANSLATE_MODEL = 'openai/gpt-oss-20b'      # replaces deprecated llama-3.1-8b-instant
+TRANSLATE_MODEL = 'openai/gpt-oss-20b'   # fast, free, separate quota
 
 # ── Load on startup ───────────────────────────────────────────
 print("Loading embedding model...")
@@ -77,6 +77,7 @@ RULES YOU MUST STRICTLY FOLLOW:
 11. When asked what specialist doctors are available in Bangladesh, list the specialties from the factual information above clearly.
 12. If we do not have a specific specialist in Bangladesh, honestly say so and suggest the overseas option or advise calling BelleVie.
 13. CRITICAL — LANGUAGE RULE: You MUST detect the language of the user's message and respond in that EXACT same language. If the user writes in English, respond in English ONLY. If the user writes in Bangla script, respond in Bangla ONLY. If the user writes in Banglish, respond in Banglish. NEVER switch languages unless the user switches first.
+14. SPELLING & GRAMMAR: Ensure absolutely no spelling mistakes or grammatical errors in your responses. For Bengali (Bangla), strictly follow standard Bangla spelling rules (প্রমিত বাংলা বানানের নিয়ম). For English, ensure proper spelling and grammar.
 
 CONTACT INFORMATION TO SHARE WHEN RELEVANT:
 - Phone: +8801805-464800
@@ -86,10 +87,7 @@ CONTACT INFORMATION TO SHARE WHEN RELEVANT:
 """
 
 # ── FastAPI ───────────────────────────────────────────────────
-app = FastAPI(
-    title="BelleVie Health Chatbot API",
-    version="1.0.0"
-)
+app = FastAPI(title="BelleVie Health Chatbot API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -126,8 +124,15 @@ def translate_to_english(text: str) -> str:
         response = groq_client.chat.completions.create(
             model=TRANSLATE_MODEL,
             messages=[
-                {"role": "system", "content": "Translate the following Bengali text to English. Return ONLY the translation."},
-                {"role": "user",   "content": text}
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional medical translator. Translate the following Bengali (Bangla) patient query "
+                        "into fluent English for a search query. Correct any obvious transcription spelling mistakes, noise, "
+                        "or grammar issues during translation so the query is clear. Return ONLY the final English translation, no other text."
+                    )
+                },
+                {"role": "user", "content": text}
             ],
             max_tokens=200,
             temperature=0
@@ -155,10 +160,12 @@ def build_context(docs: list) -> str:
 def chat_pipeline(
     user_message: str,
     conversation_history: list,
-    max_tokens: int = 600
+    max_tokens: int = 600,
+    is_voice: bool = False
 ) -> tuple:
     """
-    Core RAG logic shared by both /chat and /ws/voice.
+    Core RAG logic shared by /chat and /ws/voice.
+    is_voice=True adds conversational guidelines for voice calls.
     Returns: (response_text, conversation_history, model_used)
     """
 
@@ -171,12 +178,18 @@ def chat_pipeline(
     context = build_context(docs)
 
     # Step 3 — Build messages
-    messages = [
-        {
-            "role":    "system",
-            "content": SYSTEM_PROMPT + f"\n\nRELEVANT CONTEXT:\n{context}"
-        }
-    ]
+    system_instruction = SYSTEM_PROMPT + f"\n\nRELEVANT CONTEXT:\n{context}"
+
+    if is_voice:
+        system_instruction += (
+            "\n\n[VOICE CALL GUIDELINES: Keep your response natural, conversational, and concise. "
+            "Avoid bullet-point lists — speak in flowing sentences as a real assistant would. "
+            "Respond directly to the user's question. "
+            "CRITICAL: Avoid grammatical spelling errors in Bangla. "
+            "Use standard, formal Bengali (প্রমিত বাংলা) with correct grammar and spelling.]"
+        )
+
+    messages = [{"role": "system", "content": system_instruction}]
     messages += conversation_history[-4:]
     messages.append({
         "role":    "user",
@@ -225,11 +238,7 @@ def chat_pipeline(
 # ── Routes ────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {
-        "status":  "running",
-        "service": "BelleVie Health Chatbot API",
-        "version": "1.0.0"
-    }
+    return {"status": "running", "service": "BelleVie Health Chatbot API", "version": "1.0.0"}
 
 @app.get("/health")
 def health():
@@ -247,7 +256,8 @@ def chat_endpoint(request: ChatRequest):
     response_text, sessions[request.session_id], actual_model = chat_pipeline(
         request.message,
         sessions[request.session_id],
-        max_tokens=600
+        max_tokens=600,
+        is_voice=False
     )
 
     sessions[request.session_id] = sessions[request.session_id][-20:]

@@ -17,7 +17,7 @@ GROQ_API_KEY      = os.getenv('GROQ_API_KEY')
 SAMPLE_RATE       = 16000
 CHANNELS          = 1
 FRAME_DURATION_MS = 30
-SILENCE_THRESHOLD = 27    # 0.8 seconds — responsive but not too trigger-happy
+SILENCE_THRESHOLD = 27    # 0.8 seconds
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 vad         = webrtcvad.Vad(2)
@@ -32,12 +32,25 @@ def is_bangla(text: str) -> bool:
 
 def get_voice_token_limit(text: str) -> int:
     """
-    Bangla script uses ~3-4 tokens per word vs ~1-2 for English.
-    Give Bangla responses more room so they don't get cut off mid-sentence.
+    Bangla uses ~3-4 tokens per word vs ~1-2 for English.
+    Give Bangla more room to avoid cut-off responses.
     """
-    if is_bangla(text):
-        return 600   # Bangla needs more tokens for the same amount of spoken content
-    return 400       # English is fine at 400
+    return 600 if is_bangla(text) else 400
+
+def fix_pronunciation(text: str) -> str:
+    """
+    Fix Edge TTS mispronunciations before audio generation.
+    Only affects spoken audio — not the displayed text.
+    """
+    replacements = {
+        "BelleVie": "Bell Vee",
+        "bellevie": "Bell Vee",
+        "BELLEVIE": "Bell Vee",
+        "Sharmin":  "Sharr-meen",
+    }
+    for wrong, correct in replacements.items():
+        text = text.replace(wrong, correct)
+    return text
 
 # ── PCM to WAV ────────────────────────────────────────────────
 def pcm_to_wav(pcm_data: bytes) -> bytes:
@@ -52,9 +65,8 @@ def pcm_to_wav(pcm_data: bytes) -> bytes:
 # ── Speech to text ────────────────────────────────────────────
 async def transcribe_audio(audio_bytes: bytes) -> str:
     """
-    Transcribe using Groq Whisper in a thread so it doesn't block
-    the async event loop. Auto-detect language — most accurate for
-    mixed English/Bangla/Banglish conversations.
+    Transcribe using Groq Whisper in a thread (non-blocking).
+    Auto-detect language — most accurate for mixed English/Bangla/Banglish.
     """
     try:
         wav_bytes = pcm_to_wav(audio_bytes)
@@ -79,13 +91,15 @@ async def transcribe_audio(audio_bytes: bytes) -> str:
 async def text_to_speech_audio(text: str) -> bytes:
     """
     Convert text to MP3 using Edge TTS.
-    rate='+15%' makes speech slightly faster — more natural for a voice assistant.
+    Applies pronunciation fixes before generating audio.
+    rate='+15%' makes speech slightly faster — more natural for voice assistants.
     """
     try:
-        voice = "bn-BD-NabanitaNeural" if is_bangla(text) else "en-US-JennyNeural"
+        voice       = "bn-BD-NabanitaNeural" if is_bangla(text) else "en-US-JennyNeural"
+        spoken_text = fix_pronunciation(text)
         print(f"🔊 TTS: {voice}")
 
-        communicate = edge_tts.Communicate(text, voice, rate="+15%")
+        communicate = edge_tts.Communicate(spoken_text, voice, rate="+15%")
         buf = io.BytesIO()
 
         async for chunk in communicate.stream():
@@ -127,7 +141,6 @@ async def _wait_for_ack(ws, session_id):
                     return
             except:
                 pass
-        # ignore audio bytes while waiting
 
 # ── Main voice handler ────────────────────────────────────────
 async def handle_voice_call(
@@ -140,22 +153,20 @@ async def handle_voice_call(
     print(f"📞 Call started: {session_id}")
 
     # ── Greeting ──────────────────────────────────────────────
-    # Mic stays muted until greeting fully finishes playing on client.
-    # _wait_for_ack guarantees this — fixes "Listening during greeting" bug.
     try:
         await websocket.send_json({
             "type":    "call_started",
             "message": "Connected to BelleVie AI Assistant"
         })
 
-        greeting       = "Hello! Welcome to BelleVie Global Health Services. I'm your AI health assistant. How can I help you today?"
+        greeting       = "Hello! Welcome to Bell Vee Global Health Services. I'm Sharmin, your AI health assistant. How can I help you today?"
         greeting_audio = await text_to_speech_audio(greeting)
 
         if greeting_audio:
             await websocket.send_json({"type": "mute"})
             await websocket.send_bytes(greeting_audio)
-            await _wait_for_ack(websocket, session_id)   # mic opens only after greeting finishes
-            await asyncio.sleep(0.3)                      # guard period
+            await _wait_for_ack(websocket, session_id)
+            await asyncio.sleep(0.3)
             await websocket.send_json({"type": "unmute"})
             await websocket.send_json({
                 "type":    "listening",
@@ -170,12 +181,14 @@ async def handle_voice_call(
         return
 
     # ── Call state ────────────────────────────────────────────
-    audio_buffer    = b""
-    silence_count   = 0
-    speech_detected = False
-    speech_buffer   = b""
-    frame_size      = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2
-    muted           = False
+    audio_buffer        = b""
+    silence_count       = 0
+    speech_detected     = False
+    speech_buffer       = b""
+    frame_size          = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2
+    muted               = False
+    pre_roll_history    = []      # stores silent frames just before speech starts
+    max_pre_roll_frames = 8       # ~240ms of pre-roll
 
     try:
         while True:
@@ -188,7 +201,7 @@ async def handle_voice_call(
                 text_data = data["text"]
                 if text_data == "END_CALL":
                     print(f"📵 Call ended by user: {session_id}")
-                    goodbye       = "Thank you for calling BelleVie. Take care and stay healthy!"
+                    goodbye       = "Thank you for calling Bell Vee. Take care and stay healthy! This is Sharmin, goodbye!"
                     goodbye_audio = await text_to_speech_audio(goodbye)
                     if goodbye_audio:
                         await websocket.send_json({"type": "mute"})
@@ -196,7 +209,6 @@ async def handle_voice_call(
                         await _wait_for_ack(websocket, session_id)
                     break
 
-                # Ignore spurious audio_played in listening state
                 try:
                     msg = json.loads(text_data)
                     if msg.get("type") == "audio_played":
@@ -205,7 +217,7 @@ async def handle_voice_call(
                     pass
                 continue
 
-            # Audio bytes — skip completely if muted
+            # Audio bytes — skip if muted
             chunk = data.get("bytes", b"")
             if not chunk or muted:
                 continue
@@ -222,6 +234,10 @@ async def handle_voice_call(
                 if speech_in_frame:
                     if not speech_detected:
                         print(f"🎤 Speech started: {session_id}")
+                        # Prepend pre-roll frames so beginning of speech isn't clipped
+                        for f in pre_roll_history:
+                            speech_buffer += f
+                        pre_roll_history.clear()
                     speech_detected = True
                     silence_count   = 0
                     speech_buffer  += frame
@@ -229,6 +245,11 @@ async def handle_voice_call(
                     if speech_detected:
                         silence_count += 1
                         speech_buffer += frame
+                    else:
+                        # Store silent frames as pre-roll
+                        pre_roll_history.append(frame)
+                        if len(pre_roll_history) > max_pre_roll_frames:
+                            pre_roll_history.pop(0)
 
                 # ── Silence threshold reached ─────────────────
                 if speech_detected and silence_count >= SILENCE_THRESHOLD:
@@ -247,6 +268,7 @@ async def handle_voice_call(
                     audio_buffer    = b""
                     speech_detected = False
                     silence_count   = 0
+                    pre_roll_history.clear()
 
                     # Skip if audio too short (under 0.5 seconds)
                     if len(full_audio) < SAMPLE_RATE // 2:
@@ -275,19 +297,18 @@ async def handle_voice_call(
                         "text": transcript
                     })
 
-                    # ── RAG (non-blocking, token limit based on language) ──
+                    # ── RAG (non-blocking) ────────────────────
                     if session_id not in sessions:
                         sessions[session_id] = []
 
-                    # Detect language from transcript to set correct token limit
-                    # Bangla gets 600 tokens, English gets 400
                     token_limit = get_voice_token_limit(transcript)
 
                     def run_chat_pipeline():
                         return chat_pipeline(
                             transcript,
                             sessions[session_id],
-                            max_tokens=token_limit
+                            max_tokens=token_limit,
+                            is_voice=True
                         )
 
                     response_text, sessions[session_id], model_used = await asyncio.to_thread(run_chat_pipeline)
