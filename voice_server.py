@@ -58,6 +58,7 @@ WRONG_SCRIPT_PATTERNS = [
     '[\uAC00-\uD7AF]',   # Korean
     '[\u4E00-\u9FFF]',   # Chinese
     '[\u3040-\u30FF]',   # Japanese
+    '[\u0900-\u097F]',   # Devanagari (Hindi/Sanskrit) ← added
 ]
 
 # ── Language detection ────────────────────────────────────────
