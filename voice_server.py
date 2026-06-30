@@ -7,6 +7,7 @@ import json
 import edge_tts
 import webrtcvad
 from groq import Groq
+from openai import OpenAI
 from dotenv import load_dotenv
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -14,13 +15,22 @@ load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────
 GROQ_API_KEY      = os.getenv('GROQ_API_KEY')
+OPENAI_API_KEY     = os.getenv('OPENAI_API_KEY')
 SAMPLE_RATE       = 16000
 CHANNELS          = 1
 FRAME_DURATION_MS = 30
-SILENCE_THRESHOLD = 27    # ~0.8 seconds of silence before processing
+SILENCE_THRESHOLD = 27    # ~1.05 seconds — comfortable pause for Bangla
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 vad         = webrtcvad.Vad(2)
+
+# OpenAI client — only initialised if key present
+openai_client = None
+if OPENAI_API_KEY:
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    print("✅ OpenAI Whisper fallback enabled (used when Groq transcript looks bad)")
+else:
+    print("ℹ️  No OPENAI_API_KEY found — OpenAI Whisper fallback disabled")
 
 # ── Known garbage patterns Whisper produces on silence/noise ──
 WHISPER_HALLUCINATIONS = {
@@ -38,13 +48,16 @@ WHISPER_HALLUCINATIONS = {
 }
 
 # Scripts that are NOT Bangla or English
+# IMPORTANT: regular strings (no 'r' prefix) so \u escapes become
+# actual Unicode characters — raw strings would leave them as literal
+# backslash sequences and the regex would never match.
 WRONG_SCRIPT_PATTERNS = [
-    r'[\u0D80-\u0DFF]',   # Sinhala
-    r'[\u0600-\u06FF]',   # Arabic
-    r'[\u0400-\u04FF]',   # Cyrillic
-    r'[\uAC00-\uD7AF]',   # Korean
-    r'[\u4E00-\u9FFF]',   # Chinese
-    r'[\u3040-\u30FF]',   # Japanese
+    '[\u0D80-\u0DFF]',   # Sinhala
+    '[\u0600-\u06FF]',   # Arabic
+    '[\u0400-\u04FF]',   # Cyrillic
+    '[\uAC00-\uD7AF]',   # Korean
+    '[\u4E00-\u9FFF]',   # Chinese
+    '[\u3040-\u30FF]',   # Japanese
 ]
 
 # ── Language detection ────────────────────────────────────────
@@ -73,7 +86,7 @@ def fix_pronunciation(text: str) -> str:
 
 # ── Garbage transcript detection ──────────────────────────────
 def is_garbage_transcript(text: str, expected_lang: str = None) -> bool:
-    """Returns True if the transcript should be discarded."""
+    """Returns True if the transcript should be discarded or re-tried."""
     if not text or len(text.strip()) < 3:
         return True
 
@@ -108,12 +121,8 @@ def pcm_to_wav(pcm_data: bytes) -> bytes:
         wf.writeframes(pcm_data)
     return buf.getvalue()
 
-# ── Speech to text ────────────────────────────────────────────
-async def transcribe_audio(audio_bytes: bytes, lang_hint: str = None) -> str:
-    """
-    Transcribe using Groq Whisper in a thread (non-blocking).
-    lang_hint locks the language once known — dramatically improves accuracy.
-    """
+# ── Speech to text — Groq (primary, free) ─────────────────────
+async def transcribe_with_groq(audio_bytes: bytes, lang_hint: str = None) -> str:
     try:
         wav_bytes = pcm_to_wav(audio_bytes)
 
@@ -129,12 +138,63 @@ async def transcribe_audio(audio_bytes: bytes, lang_hint: str = None) -> str:
 
         result     = await asyncio.to_thread(call_whisper)
         transcript = result.strip() if result else ""
-        print(f"📝 Transcript ({lang_hint or 'auto'}): {transcript}")
+        print(f"📝 Groq transcript ({lang_hint or 'auto'}): {transcript}")
         return transcript
 
     except Exception as e:
-        print(f"❌ Transcription error: {e}")
+        print(f"❌ Groq transcription error: {e}")
         return ""
+
+# ── Speech to text — OpenAI (fallback, paid, only when needed) ─
+async def transcribe_with_openai(audio_bytes: bytes, lang_hint: str = None) -> str:
+    if not openai_client:
+        return ""
+    try:
+        wav_bytes      = pcm_to_wav(audio_bytes)
+        wav_file       = io.BytesIO(wav_bytes)
+        wav_file.name  = "audio.wav"   # OpenAI SDK needs a filename attribute
+
+        def call_openai():
+            params = {
+                "file":  wav_file,
+                "model": "whisper-1",
+            }
+            if lang_hint:
+                params["language"] = lang_hint
+            return openai_client.audio.transcriptions.create(**params)
+
+        result     = await asyncio.to_thread(call_openai)
+        transcript = result.text.strip() if result.text else ""
+        print(f"📝 OpenAI transcript ({lang_hint or 'auto'}): {transcript}")
+        return transcript
+
+    except Exception as e:
+        print(f"❌ OpenAI transcription error: {e}")
+        return ""
+
+# ── Combined STT — Groq first, OpenAI retry only if garbage ───
+async def transcribe_audio(audio_bytes: bytes, lang_hint: str = None) -> str:
+    """
+    Try Groq Whisper first (free). If the result looks like garbage
+    (wrong script, hallucination, empty), retry once with OpenAI Whisper
+    (paid, ~$0.006/min) which tends to be more reliable for Bangla.
+    This spends the $5 OpenAI credit only on the turns that actually
+    need it, rather than wasting it on every single call.
+    """
+    groq_transcript = await transcribe_with_groq(audio_bytes, lang_hint)
+
+    if is_garbage_transcript(groq_transcript, expected_lang=lang_hint) and openai_client:
+        print("⚠️ Groq transcript looks unreliable — retrying with OpenAI Whisper...")
+        openai_transcript = await transcribe_with_openai(audio_bytes, lang_hint)
+
+        # Only use the OpenAI result if it's actually better
+        if openai_transcript and not is_garbage_transcript(openai_transcript, expected_lang=lang_hint):
+            print("✅ OpenAI Whisper produced a usable transcript")
+            return openai_transcript
+        else:
+            print("⚠️ OpenAI Whisper also failed — falling back to Groq result")
+
+    return groq_transcript
 
 # ── Text to speech ────────────────────────────────────────────
 async def text_to_speech_audio(text: str) -> bytes:
@@ -224,15 +284,14 @@ async def handle_voice_call(
 
     # ── Call state ────────────────────────────────────────────
     audio_buffer        = b""
-    silence_count        = 0
-    speech_detected      = False
-    speech_buffer        = b""
-    frame_size           = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2
-    muted                = False
-    pre_roll_history     = []
-    max_pre_roll_frames  = 8
+    silence_count       = 0
+    speech_detected     = False
+    speech_buffer       = b""
+    frame_size          = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2
+    muted               = False
+    pre_roll_history    = []
+    max_pre_roll_frames = 8
 
-    # Language tracking — None = auto on first turn, then locked in
     session_lang = None
 
     try:
@@ -322,7 +381,7 @@ async def handle_voice_call(
                         muted = False
                         continue
 
-                    # ── STT (sequential — no stale-context bug) ────
+                    # ── STT (Groq first, OpenAI retry if needed) ──
                     transcript = await transcribe_audio(full_audio, lang_hint=session_lang)
 
                     if not transcript.strip():
@@ -334,17 +393,17 @@ async def handle_voice_call(
                         muted = False
                         continue
 
-                    # Update session language from this transcript
+                    # Update session language
                     if is_bangla(transcript):
                         if session_lang != "bn":
-                            print(f"🌐 Language locked: Bangla")
+                            print("🌐 Language locked: Bangla")
                         session_lang = "bn"
                     elif re.search(r'[a-zA-Z]', transcript) and not is_bangla(transcript):
                         if session_lang != "en":
-                            print(f"🌐 Language locked: English")
+                            print("🌐 Language locked: English")
                         session_lang = "en"
 
-                    # Garbage check
+                    # Final garbage check — discard turn if still unusable
                     if is_garbage_transcript(transcript, expected_lang=session_lang):
                         await websocket.send_json({
                             "type":    "listening",
@@ -359,7 +418,7 @@ async def handle_voice_call(
                         "text": transcript
                     })
 
-                    # ── RAG (non-blocking, sequential retrieval) ──
+                    # ── RAG (sequential — context always matches transcript) ──
                     if session_id not in sessions:
                         sessions[session_id] = []
 
@@ -371,7 +430,6 @@ async def handle_voice_call(
                             sessions[session_id],
                             max_tokens=token_limit,
                             is_voice=True
-                            # no pre_fetched_context — chat_pipeline does its own retrieval
                         )
 
                     response_text, sessions[session_id], model_used = await asyncio.to_thread(run_chat_pipeline)
