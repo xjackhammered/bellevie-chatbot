@@ -1,14 +1,16 @@
 import os
 import re
 import time
+import hashlib
 import chromadb
 from groq import Groq
+from openai import OpenAI
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
-from typing import List, Dict
+from typing import List, Dict, Optional
 from voice_server import handle_voice_call
 
 # ── Load environment ──────────────────────────────────────────
@@ -21,15 +23,32 @@ os.environ['CHROMA_TELEMETRY']     = 'False'
 GROQ_API_KEY    = os.getenv('GROQ_API_KEY')
 CHROMA_DIR      = os.getenv('CHROMA_DIR', './chroma_db')
 EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
-TOP_K_RETRIEVAL = 4
+TOP_K_RETRIEVAL = 3   # reduced from 4 — saves ~500 tokens per call, faster LLM
 
 # ── Model cascade ─────────────────────────────────────────────
+# Groq free tier daily token limits (approximate):
+#   llama-3.3-70b-versatile : ~14,400 tokens/day  ← primary, best quality
+#   mixtral-8x7b-32768      : ~500,000 tokens/day ← best fallback, real safety net
+#   openai/gpt-oss-20b      : ~200,000 tokens/day ← last Groq resort
 LLM_MODEL     = 'llama-3.3-70b-versatile'
 LLM_FALLBACKS = [
     'mixtral-8x7b-32768',
     'openai/gpt-oss-20b',
 ]
-TRANSLATE_MODEL = 'openai/gpt-oss-20b'   # fast, free, separate quota
+TRANSLATE_MODEL = 'openai/gpt-oss-20b'   # cheap, fast, separate Groq quota
+
+# ── OpenAI fallback (paid, $5 budget) ─────────────────────────
+# gpt-4o-mini: best performance-per-token in OpenAI's lineup.
+# ~$0.15/1M input tokens — a typical call costs ~$0.0002.
+# Only used when ALL Groq models are rate-limited.
+OPENAI_FALLBACK_MODEL = 'gpt-4o-mini'
+
+# ── Query cache ───────────────────────────────────────────────
+# Stores responses for repeated identical queries.
+# Keyed by hash of (english_query). Max 50 entries, then oldest is evicted.
+# Only used for text chat (/chat endpoint), NOT for voice (context changes per turn).
+QUERY_CACHE: Dict[str, str] = {}
+CACHE_MAX_SIZE = 50
 
 # ── Load on startup ───────────────────────────────────────────
 print("Loading embedding model...")
@@ -39,6 +58,14 @@ print("Connecting to ChromaDB...")
 chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
 collection    = chroma_client.get_collection('bellevie_knowledge')
 groq_client   = Groq(api_key=GROQ_API_KEY)
+
+# OpenAI client — only initialised if key is present
+openai_client = None
+if os.getenv("OPENAI_API_KEY"):
+    openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    print("✅ OpenAI fallback (gpt-4o-mini) enabled")
+else:
+    print("ℹ️  No OPENAI_API_KEY found — OpenAI fallback disabled")
 
 print(f"✅ Ready — {collection.count()} vectors loaded")
 
@@ -145,7 +172,7 @@ def retrieve(query: str) -> list:
     vector  = embedder.encode(query).tolist()
     results = collection.query(
         query_embeddings=[vector],
-        n_results=TOP_K_RETRIEVAL
+        n_results=TOP_K_RETRIEVAL   # now 3 instead of 4
     )
     return results['documents'][0]
 
@@ -156,16 +183,42 @@ def build_context(docs: list) -> str:
         context += f"[Source {i+1}]\n{trimmed}\n\n"
     return context.strip()
 
+def get_cache_key(english_query: str) -> str:
+    """SHA256 hash of the normalised query — used as cache dict key."""
+    normalised = english_query.strip().lower()
+    return hashlib.sha256(normalised.encode()).hexdigest()[:16]
+
+def cache_get(english_query: str) -> Optional[str]:
+    """Return cached response if it exists, else None."""
+    return QUERY_CACHE.get(get_cache_key(english_query))
+
+def cache_set(english_query: str, response: str) -> None:
+    """Store response in cache. Evict oldest entry when cache is full."""
+    key = get_cache_key(english_query)
+    if key in QUERY_CACHE:
+        return   # already cached, no-op
+    if len(QUERY_CACHE) >= CACHE_MAX_SIZE:
+        # Evict the first (oldest) key
+        oldest = next(iter(QUERY_CACHE))
+        del QUERY_CACHE[oldest]
+        print(f"🗑️ Cache evicted oldest entry (size was {CACHE_MAX_SIZE})")
+    QUERY_CACHE[key] = response
+    print(f"💾 Cached query (cache size: {len(QUERY_CACHE)}/{CACHE_MAX_SIZE})")
+
 # ── Shared RAG pipeline ───────────────────────────────────────
 def chat_pipeline(
     user_message: str,
     conversation_history: list,
     max_tokens: int = 600,
-    is_voice: bool = False
+    is_voice: bool = False,
+    pre_fetched_context: Optional[str] = None   # passed in from voice parallel fetch
 ) -> tuple:
     """
     Core RAG logic shared by /chat and /ws/voice.
-    is_voice=True adds conversational guidelines for voice calls.
+
+    pre_fetched_context: if provided (voice path), skip retrieval entirely —
+    the context was already fetched in parallel with STT to save time.
+
     Returns: (response_text, conversation_history, model_used)
     """
 
@@ -173,11 +226,27 @@ def chat_pipeline(
     lang          = "Bangla" if not is_english(user_message) else "English"
     english_query = translate_to_english(user_message)
 
-    # Step 2 — Retrieve relevant chunks
-    docs    = retrieve(english_query)
-    context = build_context(docs)
+    # Step 2 — Cache check (text chat only, not voice)
+    # Voice turns are not cached because the same question mid-conversation
+    # may need a different answer depending on session history.
+    if not is_voice and len(conversation_history) == 0:
+        cached = cache_get(english_query)
+        if cached:
+            print(f"⚡ Cache hit for: '{english_query[:50]}'")
+            conversation_history.append({"role": "user",      "content": user_message})
+            conversation_history.append({"role": "assistant", "content": cached})
+            return cached, conversation_history, "cache"
 
-    # Step 3 — Build messages
+    # Step 3 — Retrieve relevant chunks
+    # If voice_server already fetched context in parallel, skip retrieval here.
+    if pre_fetched_context is not None:
+        context = pre_fetched_context
+        print("⚡ Using pre-fetched context (parallel STT+retrieval)")
+    else:
+        docs    = retrieve(english_query)
+        context = build_context(docs)
+
+    # Step 4 — Build messages
     system_instruction = SYSTEM_PROMPT + f"\n\nRELEVANT CONTEXT:\n{context}"
 
     if is_voice:
@@ -196,12 +265,12 @@ def chat_pipeline(
         "content": f"[Respond in {lang} only.]\n\n{user_message}"
     })
 
-    # Step 4 — Model cascade
-    all_models        = [LLM_MODEL] + LLM_FALLBACKS
     assistant_message = None
     model_used        = None
 
-    for i, model in enumerate(all_models):
+    # ── Try all Groq models first ─────────────────────────────
+    all_groq_models = [LLM_MODEL] + LLM_FALLBACKS
+    for i, model in enumerate(all_groq_models):
         try:
             response = groq_client.chat.completions.create(
                 model=model,
@@ -212,26 +281,50 @@ def chat_pipeline(
             assistant_message = response.choices[0].message.content
             model_used        = model
             if i > 0:
-                print(f"⚠️ Using fallback model: {model}")
+                print(f"⚠️ Using Groq fallback: {model}")
             break
-
         except Exception as e:
-            if '429' in str(e) and i < len(all_models) - 1:
-                print(f"⚠️ {model} quota hit — trying next...")
-                time.sleep(2)
-                continue
+            if '429' in str(e):
+                print(f"⚠️ Groq {model} rate limited")
             else:
-                assistant_message = (
-                    "I'm experiencing high traffic right now. "
-                    "Please try again in a moment or contact us directly at "
-                    "+8801805-464800 or info.belleviebd@gmail.com."
-                )
-                model_used = "fallback_message"
-                break
+                print(f"⚠️ Groq {model} failed: {e}")
+            time.sleep(1)
+            continue
+
+    # ── If all Groq failed, try OpenAI gpt-4o-mini ───────────
+    # gpt-4o-mini: ~$0.15/1M input tokens, excellent quality,
+    # handles Bangla well, far better than any free OpenRouter model.
+    if assistant_message is None and openai_client:
+        print("⚠️ All Groq models exhausted — trying OpenAI gpt-4o-mini...")
+        try:
+            response = openai_client.chat.completions.create(
+                model=OPENAI_FALLBACK_MODEL,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.3,
+            )
+            assistant_message = response.choices[0].message.content
+            model_used        = OPENAI_FALLBACK_MODEL
+            print(f"🟢 OpenAI fallback: {OPENAI_FALLBACK_MODEL}")
+        except Exception as e:
+            print(f"⚠️ OpenAI fallback failed: {e}")
+
+    # ── Final fallback ────────────────────────────────────────
+    if assistant_message is None:
+        assistant_message = (
+            "I'm experiencing high traffic right now. "
+            "Please try again in a moment or contact us directly at "
+            "+8801805-464800 or info.belleviebd@gmail.com."
+        )
+        model_used = "fallback_message"
 
     # Step 5 — Update history
     conversation_history.append({"role": "user",      "content": user_message})
     conversation_history.append({"role": "assistant", "content": assistant_message})
+
+    # Step 6 — Cache the response for text chat (first-turn queries only)
+    if not is_voice and len(conversation_history) == 2:
+        cache_set(english_query, assistant_message)
 
     return assistant_message, conversation_history, model_used
 
@@ -245,7 +338,8 @@ def health():
     return {
         "status":         "healthy",
         "vectors_loaded": collection.count(),
-        "primary_model":  LLM_MODEL
+        "primary_model":  LLM_MODEL,
+        "cache_entries":  len(QUERY_CACHE),
     }
 
 @app.post("/chat", response_model=ChatResponse)
@@ -258,6 +352,7 @@ def chat_endpoint(request: ChatRequest):
         sessions[request.session_id],
         max_tokens=600,
         is_voice=False
+        # pre_fetched_context not passed — text chat does its own retrieval
     )
 
     sessions[request.session_id] = sessions[request.session_id][-20:]
@@ -273,6 +368,12 @@ def clear_session(session_id: str):
     if session_id in sessions:
         del sessions[session_id]
     return {"status": "cleared", "session_id": session_id}
+
+@app.delete("/cache")
+def clear_cache():
+    """Dev endpoint — flush the query cache."""
+    QUERY_CACHE.clear()
+    return {"status": "cleared", "message": "Query cache flushed"}
 
 # ── Voice WebSocket ───────────────────────────────────────────
 @app.websocket("/ws/voice/{session_id}")

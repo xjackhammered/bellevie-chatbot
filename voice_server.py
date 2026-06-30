@@ -17,10 +17,35 @@ GROQ_API_KEY      = os.getenv('GROQ_API_KEY')
 SAMPLE_RATE       = 16000
 CHANNELS          = 1
 FRAME_DURATION_MS = 30
-SILENCE_THRESHOLD = 27    # 0.8 seconds
+SILENCE_THRESHOLD = 27    # ~0.8 seconds of silence before processing
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 vad         = webrtcvad.Vad(2)
+
+# ── Known garbage patterns Whisper produces on silence/noise ──
+WHISPER_HALLUCINATIONS = {
+    "subtitles by the amara.org community",
+    "amara.org",
+    "www.moviewatcher.is",
+    "transcript:",
+    "transcribed by",
+    "♪",
+    "[music]",
+    "[applause]",
+    "[laughter]",
+    "thank you for watching",
+    "please subscribe",
+}
+
+# Scripts that are NOT Bangla or English
+WRONG_SCRIPT_PATTERNS = [
+    r'[\u0D80-\u0DFF]',   # Sinhala
+    r'[\u0600-\u06FF]',   # Arabic
+    r'[\u0400-\u04FF]',   # Cyrillic
+    r'[\uAC00-\uD7AF]',   # Korean
+    r'[\u4E00-\u9FFF]',   # Chinese
+    r'[\u3040-\u30FF]',   # Japanese
+]
 
 # ── Language detection ────────────────────────────────────────
 def is_bangla(text: str) -> bool:
@@ -31,17 +56,11 @@ def is_bangla(text: str) -> bool:
     return (bangla_chars / total_chars) >= 0.3
 
 def get_voice_token_limit(text: str) -> int:
-    """
-    Bangla uses ~3-4 tokens per word vs ~1-2 for English.
-    Give Bangla more room to avoid cut-off responses.
-    """
-    return 600 if is_bangla(text) else 400
+    """Bangla needs more tokens for the same spoken content."""
+    return 600 if is_bangla(text) else 500
 
 def fix_pronunciation(text: str) -> str:
-    """
-    Fix Edge TTS mispronunciations before audio generation.
-    Only affects spoken audio — not the displayed text.
-    """
+    """Fix Edge TTS mispronunciations before audio generation."""
     replacements = {
         "BelleVie": "Bell Vee",
         "bellevie": "Bell Vee",
@@ -51,6 +70,33 @@ def fix_pronunciation(text: str) -> str:
     for wrong, correct in replacements.items():
         text = text.replace(wrong, correct)
     return text
+
+# ── Garbage transcript detection ──────────────────────────────
+def is_garbage_transcript(text: str, expected_lang: str = None) -> bool:
+    """Returns True if the transcript should be discarded."""
+    if not text or len(text.strip()) < 3:
+        return True
+
+    lower = text.strip().lower()
+
+    for pattern in WHISPER_HALLUCINATIONS:
+        if pattern in lower:
+            print(f"🗑️ Hallucination detected: '{text[:60]}'")
+            return True
+
+    for script_pattern in WRONG_SCRIPT_PATTERNS:
+        wrong_chars = len(re.findall(script_pattern, text))
+        if wrong_chars > 2:
+            print(f"🗑️ Wrong script detected: '{text[:60]}'")
+            return True
+
+    if expected_lang == "bn":
+        bangla_ratio = len(re.findall(r'[\u0980-\u09FF]', text)) / max(len(text.replace(' ', '')), 1)
+        if bangla_ratio < 0.3:
+            print(f"🗑️ Expected Bangla but got: '{text[:60]}'")
+            return True
+
+    return False
 
 # ── PCM to WAV ────────────────────────────────────────────────
 def pcm_to_wav(pcm_data: bytes) -> bytes:
@@ -63,24 +109,27 @@ def pcm_to_wav(pcm_data: bytes) -> bytes:
     return buf.getvalue()
 
 # ── Speech to text ────────────────────────────────────────────
-async def transcribe_audio(audio_bytes: bytes) -> str:
+async def transcribe_audio(audio_bytes: bytes, lang_hint: str = None) -> str:
     """
     Transcribe using Groq Whisper in a thread (non-blocking).
-    Auto-detect language — most accurate for mixed English/Bangla/Banglish.
+    lang_hint locks the language once known — dramatically improves accuracy.
     """
     try:
         wav_bytes = pcm_to_wav(audio_bytes)
 
         def call_whisper():
-            return groq_client.audio.transcriptions.create(
-                file=("audio.wav", wav_bytes),
-                model="whisper-large-v3",
-                response_format="text",
-            )
+            params = {
+                "file":            ("audio.wav", wav_bytes),
+                "model":           "whisper-large-v3",
+                "response_format": "text",
+            }
+            if lang_hint:
+                params["language"] = lang_hint
+            return groq_client.audio.transcriptions.create(**params)
 
         result     = await asyncio.to_thread(call_whisper)
         transcript = result.strip() if result else ""
-        print(f"📝 Transcript: {transcript}")
+        print(f"📝 Transcript ({lang_hint or 'auto'}): {transcript}")
         return transcript
 
     except Exception as e:
@@ -89,11 +138,7 @@ async def transcribe_audio(audio_bytes: bytes) -> str:
 
 # ── Text to speech ────────────────────────────────────────────
 async def text_to_speech_audio(text: str) -> bytes:
-    """
-    Convert text to MP3 using Edge TTS.
-    Applies pronunciation fixes before generating audio.
-    rate='+15%' makes speech slightly faster — more natural for voice assistants.
-    """
+    """Convert text to MP3 using Edge TTS, with pronunciation fixes applied."""
     try:
         voice       = "bn-BD-NabanitaNeural" if is_bangla(text) else "en-US-JennyNeural"
         spoken_text = fix_pronunciation(text)
@@ -123,10 +168,7 @@ def is_speech(frame: bytes) -> bool:
 
 # ── Helper: wait for client audio_played ack ─────────────────
 async def _wait_for_ack(ws, session_id):
-    """
-    Wait until client sends audio_played JSON.
-    Mic only reopens after assistant has completely finished speaking.
-    """
+    """Mic only reopens AFTER the assistant has completely finished speaking."""
     while True:
         data = await ws.receive()
         if data.get("type") == "websocket.disconnect":
@@ -182,13 +224,16 @@ async def handle_voice_call(
 
     # ── Call state ────────────────────────────────────────────
     audio_buffer        = b""
-    silence_count       = 0
-    speech_detected     = False
-    speech_buffer       = b""
-    frame_size          = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2
-    muted               = False
-    pre_roll_history    = []      # stores silent frames just before speech starts
-    max_pre_roll_frames = 8       # ~240ms of pre-roll
+    silence_count        = 0
+    speech_detected      = False
+    speech_buffer        = b""
+    frame_size           = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2
+    muted                = False
+    pre_roll_history     = []
+    max_pre_roll_frames  = 8
+
+    # Language tracking — None = auto on first turn, then locked in
+    session_lang = None
 
     try:
         while True:
@@ -196,7 +241,7 @@ async def handle_voice_call(
             if data.get("type") == "websocket.disconnect":
                 raise WebSocketDisconnect(data.get("code", 1000))
 
-            # End call signal
+            # ── Control messages ──────────────────────────────
             if "text" in data:
                 text_data = data["text"]
                 if text_data == "END_CALL":
@@ -217,14 +262,14 @@ async def handle_voice_call(
                     pass
                 continue
 
-            # Audio bytes — skip if muted
+            # ── Audio bytes ───────────────────────────────────
             chunk = data.get("bytes", b"")
             if not chunk or muted:
                 continue
 
             audio_buffer += chunk
 
-            # ── VAD processing ────────────────────────────────
+            # ── VAD frame processing ──────────────────────────
             while len(audio_buffer) >= frame_size:
                 frame        = audio_buffer[:frame_size]
                 audio_buffer = audio_buffer[frame_size:]
@@ -234,7 +279,6 @@ async def handle_voice_call(
                 if speech_in_frame:
                     if not speech_detected:
                         print(f"🎤 Speech started: {session_id}")
-                        # Prepend pre-roll frames so beginning of speech isn't clipped
                         for f in pre_roll_history:
                             speech_buffer += f
                         pre_roll_history.clear()
@@ -246,14 +290,13 @@ async def handle_voice_call(
                         silence_count += 1
                         speech_buffer += frame
                     else:
-                        # Store silent frames as pre-roll
                         pre_roll_history.append(frame)
                         if len(pre_roll_history) > max_pre_roll_frames:
                             pre_roll_history.pop(0)
 
-                # ── Silence threshold reached ─────────────────
+                # ── Silence threshold reached — process turn ──
                 if speech_detected and silence_count >= SILENCE_THRESHOLD:
-                    print(f"⏸️ Processing speech: {session_id}")
+                    print(f"⏸️ Silence detected — processing: {session_id}")
 
                     await websocket.send_json({"type": "mute"})
                     muted = True
@@ -270,7 +313,6 @@ async def handle_voice_call(
                     silence_count   = 0
                     pre_roll_history.clear()
 
-                    # Skip if audio too short (under 0.5 seconds)
                     if len(full_audio) < SAMPLE_RATE // 2:
                         await websocket.send_json({
                             "type":    "listening",
@@ -280,8 +322,8 @@ async def handle_voice_call(
                         muted = False
                         continue
 
-                    # ── STT (non-blocking) ────────────────────
-                    transcript = await transcribe_audio(full_audio)
+                    # ── STT (sequential — no stale-context bug) ────
+                    transcript = await transcribe_audio(full_audio, lang_hint=session_lang)
 
                     if not transcript.strip():
                         await websocket.send_json({
@@ -292,12 +334,32 @@ async def handle_voice_call(
                         muted = False
                         continue
 
+                    # Update session language from this transcript
+                    if is_bangla(transcript):
+                        if session_lang != "bn":
+                            print(f"🌐 Language locked: Bangla")
+                        session_lang = "bn"
+                    elif re.search(r'[a-zA-Z]', transcript) and not is_bangla(transcript):
+                        if session_lang != "en":
+                            print(f"🌐 Language locked: English")
+                        session_lang = "en"
+
+                    # Garbage check
+                    if is_garbage_transcript(transcript, expected_lang=session_lang):
+                        await websocket.send_json({
+                            "type":    "listening",
+                            "message": "Didn't catch that clearly. Please speak again."
+                        })
+                        await websocket.send_json({"type": "unmute"})
+                        muted = False
+                        continue
+
                     await websocket.send_json({
                         "type": "transcript",
                         "text": transcript
                     })
 
-                    # ── RAG (non-blocking) ────────────────────
+                    # ── RAG (non-blocking, sequential retrieval) ──
                     if session_id not in sessions:
                         sessions[session_id] = []
 
@@ -309,10 +371,11 @@ async def handle_voice_call(
                             sessions[session_id],
                             max_tokens=token_limit,
                             is_voice=True
+                            # no pre_fetched_context — chat_pipeline does its own retrieval
                         )
 
                     response_text, sessions[session_id], model_used = await asyncio.to_thread(run_chat_pipeline)
-                    print(f"🤖 [{model_used}] ({token_limit} tokens) Response: {response_text[:80]}...")
+                    print(f"🤖 [{model_used}] ({token_limit} tok) Response: {response_text[:80]}...")
 
                     await websocket.send_json({
                         "type": "response_text",
