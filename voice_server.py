@@ -7,32 +7,43 @@ import json
 import edge_tts
 import webrtcvad
 from groq import Groq
-from openai import OpenAI
 from dotenv import load_dotenv
 from fastapi import WebSocket, WebSocketDisconnect
 
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────
-GROQ_API_KEY      = os.getenv('GROQ_API_KEY')
-OPENAI_API_KEY     = os.getenv('OPENAI_API_KEY')
-SAMPLE_RATE       = 16000
-CHANNELS          = 1
-FRAME_DURATION_MS = 30
-SILENCE_THRESHOLD = 27    # ~1.05 seconds — comfortable pause for Bangla
+GROQ_API_KEY             = os.getenv('GROQ_API_KEY')
+GOOGLE_STT_CREDENTIALS   = os.getenv('GOOGLE_STT_CREDENTIALS')
+SAMPLE_RATE              = 16000
+CHANNELS                 = 1
+FRAME_DURATION_MS        = 30
+SILENCE_THRESHOLD        = 27    # ~0.8 seconds
 
-groq_client = Groq(api_key=GROQ_API_KEY)
-vad         = webrtcvad.Vad(2)
+groq_client      = Groq(api_key=GROQ_API_KEY)
+vad              = webrtcvad.Vad(2)
+google_stt_client = None
 
-# OpenAI client — only initialised if key present
-openai_client = None
-if OPENAI_API_KEY:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    print("✅ OpenAI Whisper fallback enabled (used when Groq transcript looks bad)")
+# ── Google Cloud STT setup ────────────────────────────────────
+if GOOGLE_STT_CREDENTIALS and os.path.exists(GOOGLE_STT_CREDENTIALS):
+    try:
+        from google.cloud import speech
+        from google.oauth2 import service_account
+
+        credentials = service_account.Credentials.from_service_account_file(
+            GOOGLE_STT_CREDENTIALS
+        )
+        google_stt_client = speech.SpeechClient(credentials=credentials)
+        print("✅ Google Cloud STT enabled as PRIMARY for Bangla (bn-BD)")
+    except Exception as e:
+        print(f"⚠️  Google Cloud STT failed to initialise: {e}")
+        print("    Falling back to Groq Whisper as primary")
 else:
-    print("ℹ️  No OPENAI_API_KEY found — OpenAI Whisper fallback disabled")
+    print("ℹ️  No GOOGLE_STT_CREDENTIALS found — using Groq Whisper as primary")
 
-# ── Known garbage patterns Whisper produces on silence/noise ──
+print("✅ Groq Whisper ready as fallback STT")
+
+# ── Known garbage patterns ────────────────────────────────────
 WHISPER_HALLUCINATIONS = {
     "subtitles by the amara.org community",
     "amara.org",
@@ -47,10 +58,7 @@ WHISPER_HALLUCINATIONS = {
     "please subscribe",
 }
 
-# Scripts that are NOT Bangla or English
-# IMPORTANT: regular strings (no 'r' prefix) so \u escapes become
-# actual Unicode characters — raw strings would leave them as literal
-# backslash sequences and the regex would never match.
+# Plain strings (no r prefix) so \u escapes resolve to Unicode
 WRONG_SCRIPT_PATTERNS = [
     '[\u0D80-\u0DFF]',   # Sinhala
     '[\u0600-\u06FF]',   # Arabic
@@ -58,23 +66,26 @@ WRONG_SCRIPT_PATTERNS = [
     '[\uAC00-\uD7AF]',   # Korean
     '[\u4E00-\u9FFF]',   # Chinese
     '[\u3040-\u30FF]',   # Japanese
-    '[\u0900-\u097F]',   # Devanagari (Hindi/Sanskrit) ← added
+    '[\u0900-\u097F]',   # Devanagari (Hindi)
 ]
 
 # ── Language detection ────────────────────────────────────────
 def is_bangla(text: str) -> bool:
-    bangla_chars = len(re.findall(r'[\u0980-\u09FF]', text))
+    bangla_chars = len(re.findall('[\u0980-\u09FF]', text))
     total_chars  = len(text.replace(' ', ''))
     if total_chars == 0:
         return False
     return (bangla_chars / total_chars) >= 0.3
 
 def get_voice_token_limit(text: str) -> int:
-    """Bangla needs more tokens for the same spoken content."""
-    return 600 if is_bangla(text) else 500
+    """
+    Higher limits for voice calls – ensures responses are complete,
+    especially for long Bangla explanations like the NGO program.
+    Bangla needs ~3‑4 tokens per word vs ~1‑2 for English.
+    """
+    return 1024 if is_bangla(text) else 800
 
 def fix_pronunciation(text: str) -> str:
-    """Fix Edge TTS mispronunciations before audio generation."""
     replacements = {
         "BelleVie": "Bell Vee",
         "bellevie": "Bell Vee",
@@ -87,7 +98,6 @@ def fix_pronunciation(text: str) -> str:
 
 # ── Garbage transcript detection ──────────────────────────────
 def is_garbage_transcript(text: str, expected_lang: str = None) -> bool:
-    """Returns True if the transcript should be discarded or re-tried."""
     if not text or len(text.strip()) < 3:
         return True
 
@@ -105,9 +115,9 @@ def is_garbage_transcript(text: str, expected_lang: str = None) -> bool:
             return True
 
     if expected_lang == "bn":
-        bangla_ratio = len(re.findall(r'[\u0980-\u09FF]', text)) / max(len(text.replace(' ', '')), 1)
-        if bangla_ratio < 0.3:
-            print(f"🗑️ Expected Bangla but got: '{text[:60]}'")
+        bangla_ratio = len(re.findall('[\u0980-\u09FF]', text)) / max(len(text.replace(' ', '')), 1)
+        if bangla_ratio < 0.15:
+            print(f"🗑️ Expected Bangla but got ({bangla_ratio:.0%} Bangla): '{text[:60]}'")
             return True
 
     return False
@@ -122,7 +132,48 @@ def pcm_to_wav(pcm_data: bytes) -> bytes:
         wf.writeframes(pcm_data)
     return buf.getvalue()
 
-# ── Speech to text — Groq (primary, free) ─────────────────────
+# ── STT — Google Cloud (primary for Bangla) ───────────────────
+async def transcribe_with_google(audio_bytes: bytes, lang_hint: str = None) -> str:
+    if not google_stt_client:
+        return ""
+    try:
+        from google.cloud import speech
+
+        if lang_hint == "bn" or lang_hint is None:
+            language_code      = "bn-BD"
+            alt_language_codes = ["en-US"]
+        else:
+            language_code      = "en-US"
+            alt_language_codes = ["bn-BD"]
+
+        audio   = speech.RecognitionAudio(content=audio_bytes)
+        config  = speech.RecognitionConfig(
+            encoding                  = speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz         = SAMPLE_RATE,
+            language_code             = language_code,
+            alternative_language_codes= alt_language_codes,
+            enable_automatic_punctuation = True,
+            model                     = "latest_long",
+        )
+
+        def call_google():
+            return google_stt_client.recognize(config=config, audio=audio)
+
+        response   = await asyncio.to_thread(call_google)
+        transcript = ""
+
+        for result in response.results:
+            transcript += result.alternatives[0].transcript + " "
+
+        transcript = transcript.strip()
+        print(f"📝 Google STT ({language_code}): {transcript}")
+        return transcript
+
+    except Exception as e:
+        print(f"❌ Google STT error: {e}")
+        return ""
+
+# ── STT — Groq Whisper (fallback) ────────────────────────────
 async def transcribe_with_groq(audio_bytes: bytes, lang_hint: str = None) -> str:
     try:
         wav_bytes = pcm_to_wav(audio_bytes)
@@ -146,60 +197,21 @@ async def transcribe_with_groq(audio_bytes: bytes, lang_hint: str = None) -> str
         print(f"❌ Groq transcription error: {e}")
         return ""
 
-# ── Speech to text — OpenAI (fallback, paid, only when needed) ─
-async def transcribe_with_openai(audio_bytes: bytes, lang_hint: str = None) -> str:
-    if not openai_client:
-        return ""
-    try:
-        wav_bytes      = pcm_to_wav(audio_bytes)
-        wav_file       = io.BytesIO(wav_bytes)
-        wav_file.name  = "audio.wav"   # OpenAI SDK needs a filename attribute
-
-        def call_openai():
-            params = {
-                "file":  wav_file,
-                "model": "whisper-1",
-            }
-            if lang_hint:
-                params["language"] = lang_hint
-            return openai_client.audio.transcriptions.create(**params)
-
-        result     = await asyncio.to_thread(call_openai)
-        transcript = result.text.strip() if result.text else ""
-        print(f"📝 OpenAI transcript ({lang_hint or 'auto'}): {transcript}")
-        return transcript
-
-    except Exception as e:
-        print(f"❌ OpenAI transcription error: {e}")
-        return ""
-
-# ── Combined STT — Groq first, OpenAI retry only if garbage ───
+# ── Combined STT — Google primary, Groq fallback ──────────────
 async def transcribe_audio(audio_bytes: bytes, lang_hint: str = None) -> str:
-    """
-    Try Groq Whisper first (free). If the result looks like garbage
-    (wrong script, hallucination, empty), retry once with OpenAI Whisper
-    (paid, ~$0.006/min) which tends to be more reliable for Bangla.
-    This spends the $5 OpenAI credit only on the turns that actually
-    need it, rather than wasting it on every single call.
-    """
-    groq_transcript = await transcribe_with_groq(audio_bytes, lang_hint)
-
-    if is_garbage_transcript(groq_transcript, expected_lang=lang_hint) and openai_client:
-        print("⚠️ Groq transcript looks unreliable — retrying with OpenAI Whisper...")
-        openai_transcript = await transcribe_with_openai(audio_bytes, lang_hint)
-
-        # Only use the OpenAI result if it's actually better
-        if openai_transcript and not is_garbage_transcript(openai_transcript, expected_lang=lang_hint):
-            print("✅ OpenAI Whisper produced a usable transcript")
-            return openai_transcript
+    if google_stt_client:
+        transcript = await transcribe_with_google(audio_bytes, lang_hint)
+        if transcript and not is_garbage_transcript(transcript, expected_lang=lang_hint):
+            return transcript
+        if transcript:
+            print("⚠️ Google STT result looked unreliable — trying Groq...")
         else:
-            print("⚠️ OpenAI Whisper also failed — falling back to Groq result")
+            print("⚠️ Google STT returned nothing — trying Groq...")
 
-    return groq_transcript
+    return await transcribe_with_groq(audio_bytes, lang_hint)
 
 # ── Text to speech ────────────────────────────────────────────
 async def text_to_speech_audio(text: str) -> bytes:
-    """Convert text to MP3 using Edge TTS, with pronunciation fixes applied."""
     try:
         voice       = "bn-BD-NabanitaNeural" if is_bangla(text) else "en-US-JennyNeural"
         spoken_text = fix_pronunciation(text)
@@ -229,7 +241,6 @@ def is_speech(frame: bytes) -> bool:
 
 # ── Helper: wait for client audio_played ack ─────────────────
 async def _wait_for_ack(ws, session_id):
-    """Mic only reopens AFTER the assistant has completely finished speaking."""
     while True:
         data = await ws.receive()
         if data.get("type") == "websocket.disconnect":
@@ -292,8 +303,7 @@ async def handle_voice_call(
     muted               = False
     pre_roll_history    = []
     max_pre_roll_frames = 8
-
-    session_lang = None
+    session_lang        = "bn"   # Bangla-first, switches to "en" if English detected
 
     try:
         while True:
@@ -301,7 +311,6 @@ async def handle_voice_call(
             if data.get("type") == "websocket.disconnect":
                 raise WebSocketDisconnect(data.get("code", 1000))
 
-            # ── Control messages ──────────────────────────────
             if "text" in data:
                 text_data = data["text"]
                 if text_data == "END_CALL":
@@ -322,14 +331,12 @@ async def handle_voice_call(
                     pass
                 continue
 
-            # ── Audio bytes ───────────────────────────────────
             chunk = data.get("bytes", b"")
             if not chunk or muted:
                 continue
 
             audio_buffer += chunk
 
-            # ── VAD frame processing ──────────────────────────
             while len(audio_buffer) >= frame_size:
                 frame        = audio_buffer[:frame_size]
                 audio_buffer = audio_buffer[frame_size:]
@@ -354,7 +361,6 @@ async def handle_voice_call(
                         if len(pre_roll_history) > max_pre_roll_frames:
                             pre_roll_history.pop(0)
 
-                # ── Silence threshold reached — process turn ──
                 if speech_detected and silence_count >= SILENCE_THRESHOLD:
                     print(f"⏸️ Silence detected — processing: {session_id}")
 
@@ -382,7 +388,7 @@ async def handle_voice_call(
                         muted = False
                         continue
 
-                    # ── STT (Groq first, OpenAI retry if needed) ──
+                    # ── STT ───────────────────────────────────
                     transcript = await transcribe_audio(full_audio, lang_hint=session_lang)
 
                     if not transcript.strip():
@@ -397,14 +403,14 @@ async def handle_voice_call(
                     # Update session language
                     if is_bangla(transcript):
                         if session_lang != "bn":
-                            print("🌐 Language locked: Bangla")
+                            print("🌐 Language switched to: Bangla")
                         session_lang = "bn"
                     elif re.search(r'[a-zA-Z]', transcript) and not is_bangla(transcript):
                         if session_lang != "en":
-                            print("🌐 Language locked: English")
+                            print("🌐 Language switched to: English")
                         session_lang = "en"
 
-                    # Final garbage check — discard turn if still unusable
+                    # Garbage check
                     if is_garbage_transcript(transcript, expected_lang=session_lang):
                         await websocket.send_json({
                             "type":    "listening",
@@ -419,7 +425,7 @@ async def handle_voice_call(
                         "text": transcript
                     })
 
-                    # ── RAG (sequential — context always matches transcript) ──
+                    # ── RAG ───────────────────────────────────
                     if session_id not in sessions:
                         sessions[session_id] = []
 

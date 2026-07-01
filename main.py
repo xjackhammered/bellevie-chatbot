@@ -22,44 +22,39 @@ os.environ['CHROMA_TELEMETRY']     = 'False'
 # ── Config ────────────────────────────────────────────────────
 GROQ_API_KEY    = os.getenv('GROQ_API_KEY')
 CHROMA_DIR      = os.getenv('CHROMA_DIR', './chroma_db')
-EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
-TOP_K_RETRIEVAL = 3   # reduced from 4 — saves ~500 tokens per call, faster LLM
+
+# ── Embedding model ────────────────────────────────────────────
+EMBEDDING_MODEL  = 'intfloat/multilingual-e5-base'
+COLLECTION_NAME  = 'bellevie_knowledge_multilingual'
+TOP_K_RETRIEVAL  = 5
 
 # ── Model cascade ─────────────────────────────────────────────
-# Groq free tier daily token limits (approximate):
-#   llama-3.3-70b-versatile : ~14,400 tokens/day  ← primary, best quality
-#   mixtral-8x7b-32768      : ~500,000 tokens/day ← best fallback, real safety net
-#   openai/gpt-oss-20b      : ~200,000 tokens/day ← last Groq resort
 LLM_MODEL     = 'llama-3.3-70b-versatile'
 LLM_FALLBACKS = [
-    'mixtral-8x7b-32768',
     'openai/gpt-oss-20b',
 ]
-TRANSLATE_MODEL = 'openai/gpt-oss-20b'   # cheap, fast, separate Groq quota
-
-# ── OpenAI fallback (paid, $5 budget) ─────────────────────────
-# gpt-4o-mini: best performance-per-token in OpenAI's lineup.
-# ~$0.15/1M input tokens — a typical call costs ~$0.0002.
-# Only used when ALL Groq models are rate-limited.
+TRANSLATE_MODEL = 'openai/gpt-oss-20b'
 OPENAI_FALLBACK_MODEL = 'gpt-4o-mini'
 
 # ── Query cache ───────────────────────────────────────────────
-# Stores responses for repeated identical queries.
-# Keyed by hash of (english_query). Max 50 entries, then oldest is evicted.
-# Only used for text chat (/chat endpoint), NOT for voice (context changes per turn).
 QUERY_CACHE: Dict[str, str] = {}
 CACHE_MAX_SIZE = 50
 
 # ── Load on startup ───────────────────────────────────────────
-print("Loading embedding model...")
+print(f"Loading embedding model: {EMBEDDING_MODEL}...")
 embedder = SentenceTransformer(EMBEDDING_MODEL)
 
-print("Connecting to ChromaDB...")
+print(f"Connecting to ChromaDB collection: {COLLECTION_NAME}...")
 chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
-collection    = chroma_client.get_collection('bellevie_knowledge')
-groq_client   = Groq(api_key=GROQ_API_KEY)
+try:
+    collection = chroma_client.get_collection(COLLECTION_NAME)
+except Exception as e:
+    print(f"❌ Could not open collection '{COLLECTION_NAME}': {e}")
+    print(f"   Did you run migrate_to_multilingual_embeddings.py yet?")
+    raise
 
-# OpenAI client — only initialised if key is present
+groq_client = Groq(api_key=GROQ_API_KEY)
+
 openai_client = None
 if os.getenv("OPENAI_API_KEY"):
     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -67,10 +62,10 @@ if os.getenv("OPENAI_API_KEY"):
 else:
     print("ℹ️  No OPENAI_API_KEY found — OpenAI fallback disabled")
 
-print(f"✅ Ready — {collection.count()} vectors loaded")
+print(f"✅ Ready — {collection.count()} vectors loaded (multilingual embeddings)")
 
 # ── System prompt ─────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a helpful and empathetic healthcare assistant for BelleVie Global Health Services — a comprehensive healthcare facilitation company based in Dhaka, Bangladesh. Your tagline is "A friend in need."
+SYSTEM_PROMPT = """You are a helpful and empathetic healthcare assistant for BelleVie Global Health Services — a comprehensive healthcare facilitation company based in Dhaka, Bangladesh. Your tagline is "A friend in need" ("প্রয়োজনে একজন বন্ধু").
 
 BelleVie helps patients with:
 - Finding and consulting specialist doctors in Bangladesh and internationally
@@ -88,26 +83,30 @@ FACTUAL INFORMATION YOU MUST KNOW:
 - Total international affiliated hospitals: 85
 - Specialist doctors in Bangladesh cover these fields: Urology, Surgical Oncology, Radiotherapy & Oncology, Clinical Oncology, Cancer (Oncology), Periodontology, Oral & Maxillofacial Surgery, Gynaecology & Obstetrics, Gastroenterology, Medicine & Gastroenterology, Internal Medicine, Cardiology, Haematology, General Surgery, Laparoscopy & Breast Surgery
 - We do NOT currently have eye specialists or pulmonologists available in Bangladesh. For these, recommend overseas options or advise contacting BelleVie directly.
-- BelleVie Health Protection System: A special program for NGO workers and loan recipients in Bangladesh offering 12 layers of health protection, digital health management, telemedicine, critical illness coverage, international medical support, and community health management.
+- BelleVie Health Protection System (বেলভি স্বাস্থ্য সুরক্ষা ব্যবস্থা): A special program for NGO workers and loan recipients in Bangladesh offering 12 layers of health protection, digital health management, telemedicine, critical illness coverage, international medical support, and community health management.
 
 RULES YOU MUST STRICTLY FOLLOW:
 1. Only answer based on the context provided. Do not make up doctors, hospitals, or services not in the context.
-2. NEVER give specific cost or price estimates for medical treatments, surgeries, or hospital stays. If asked about cost, always say: "Treatment costs vary depending on your specific condition and requirements. Please contact BelleVie at +8801805-464800 or email info.belleviebd@gmail.com for a personalized cost estimate."
-3. If the context does not contain enough information to answer, say: "I don't have that information right now. Please contact BelleVie directly at +8801805464400 or email info.belleviebd@gmail.com."
-4. When a user asks about a doctor's appointment time or schedule, always respond with: "To book an appointment, please call BelleVie at +8801805464400 or email info.belleviebd@gmail.com. Our team will arrange everything for you."
+2. NEVER give specific cost or price estimates for medical treatments, surgeries, or hospital stays. If asked about cost, always say: "Treatment costs vary depending on your specific condition and requirements. Please contact BelleVie at 01805464400 or email info.belleviebd@gmail.com for a personalized cost estimate." (In Bangla: "চিকিৎসার খরচ আপনার নির্দিষ্ট অবস্থা ও প্রয়োজনের উপর নির্ভর করে ভিন্ন হতে পারে। সঠিক খরচ জানতে অনুগ্রহ করে বেলভির সাথে যোগাযোগ করুন 01805464400 অথবা ইমেইল করুন info.belleviebd@gmail.com।")
+3. If the context does not contain enough information to answer, say: "I don't have that information right now. Please contact BelleVie directly at 01805464400 or email info.belleviebd@gmail.com." (In Bangla: "এই মুহূর্তে আমার কাছে এই তথ্যটি নেই। অনুগ্রহ করে সরাসরি বেলভির সাথে যোগাযোগ করুন 01805464400 অথবা ইমেইল করুন info.belleviebd@gmail.com।")
+4. When a user asks about a doctor's appointment time or schedule, always respond with: "To book an appointment, please call BelleVie at 01805464400 or email info.belleviebd@gmail.com. Our team will arrange everything for you." (In Bangla: "অ্যাপয়েন্টমেন্ট বুক করতে অনুগ্রহ করে বেলভিতে কল করুন 01805464400 অথবা ইমেইল করুন info.belleviebd@gmail.com। আমাদের টিম সবকিছু ব্যবস্থা করে দেবে।")
 5. Always be warm, clear, and patient. Users may be worried about their health.
 6. When recommending hospitals or doctors, briefly explain why they are relevant to the user's condition.
 7. Always end responses about overseas treatment by reminding the user that BelleVie handles visa, airport reception, and translation support.
 8. Keep responses concise and easy to understand. Avoid overly technical language.
-9. If a user seems to be in a medical emergency, immediately direct them to call +8801805-464800 for BelleVie's 24/7 emergency line.
+9. If a user seems to be in a medical emergency, immediately direct them to call 01805464400 for BelleVie's 24/7 emergency line.
 10. When asked about total number of hospitals or doctors, use the factual numbers above — do not guess from context.
 11. When asked what specialist doctors are available in Bangladesh, list the specialties from the factual information above clearly.
 12. If we do not have a specific specialist in Bangladesh, honestly say so and suggest the overseas option or advise calling BelleVie.
 13. CRITICAL — LANGUAGE RULE: You MUST detect the language of the user's message and respond in that EXACT same language. If the user writes in English, respond in English ONLY. If the user writes in Bangla script, respond in Bangla ONLY. If the user writes in Banglish, respond in Banglish. NEVER switch languages unless the user switches first.
-14. SPELLING & GRAMMAR: Ensure absolutely no spelling mistakes or grammatical errors in your responses. For Bengali (Bangla), strictly follow standard Bangla spelling rules (প্রমিত বাংলা বানানের নিয়ম). For English, ensure proper spelling and grammar.
+    (ভাষার নিয়ম: ব্যবহারকারী যে ভাষায় বার্তা লেখেন বা বলেন, আপনাকে অবশ্যই সেই একই ভাষায় উত্তর দিতে হবে। ব্যবহারকারী বাংলায় লিখলে শুধু বাংলায় উত্তর দিন। ব্যবহারকারী ইংরেজিতে লিখলে শুধু ইংরেজিতে উত্তর দিন। ব্যবহারকারী নিজে ভাষা পরিবর্তন না করলে আপনি কখনোই ভাষা পরিবর্তন করবেন না।)
+    Use formal, respectful আপনি (not তুমি) when addressing the user in Bangla — this is a healthcare context and formal address is expected regardless of the user's age or how they address you.
+14. SPELLING & GRAMMAR: Ensure absolutely no spelling mistakes or grammatical errors in your responses. For Bengali (Bangla), strictly follow standard Bangla spelling rules (প্রমিত বাংলা বানানের নিয়ম) — avoid informal transliteration, avoid mixing English words into a Bangla sentence unless the term has no natural Bangla equivalent (e.g. proper nouns like hospital names, "BelleVie", or medical specialty names where the Bangla term would be unfamiliar to patients). For English, ensure proper spelling and grammar.
+    (বানান ও ব্যাকরণ: আপনার উত্তরে কোনো বানান বা ব্যাকরণগত ভুল থাকা চলবে না। বাংলার ক্ষেত্রে প্রমিত বাংলা বানানের নিয়ম কঠোরভাবে মেনে চলুন এবং অপ্রয়োজনীয় ইংরেজি শব্দ মেশানো এড়িয়ে চলুন, তবে প্রতিষ্ঠানের নাম, হাসপাতালের নাম বা চিকিৎসা বিশেষজ্ঞের নাম যেগুলোর প্রচলিত বাংলা প্রতিশব্দ রোগীদের কাছে অপরিচিত হতে পারে, সেগুলো ব্যতিক্রম।)
+15. NEVER repeat information you have already given in this conversation. If the user asks a follow‑up, build on what was said before rather than starting from scratch.
 
 CONTACT INFORMATION TO SHARE WHEN RELEVANT:
-- Phone: +8801805464400
+- Phone: 01805464400
 - Email: info.belleviebd@gmail.com
 - Website: www.belleviebd.com
 - Address: Crown Park (3rd Floor), House 6/4, Block B, Humayun Road, Mohammadpur, Dhaka-1207
@@ -169,36 +168,33 @@ def translate_to_english(text: str) -> str:
         return text
 
 def retrieve(query: str) -> list:
-    vector  = embedder.encode(query).tolist()
+    prefixed_query = "query: " + query
+    vector  = embedder.encode(prefixed_query).tolist()
     results = collection.query(
         query_embeddings=[vector],
-        n_results=TOP_K_RETRIEVAL   # now 3 instead of 4
+        n_results=TOP_K_RETRIEVAL
     )
     return results['documents'][0]
 
 def build_context(docs: list) -> str:
     context = ""
     for i, doc in enumerate(docs):
-        trimmed  = doc[:500] + "..." if len(doc) > 500 else doc
+        trimmed  = doc[:1500] + "..." if len(doc) > 1500 else doc
         context += f"[Source {i+1}]\n{trimmed}\n\n"
     return context.strip()
 
-def get_cache_key(english_query: str) -> str:
-    """SHA256 hash of the normalised query — used as cache dict key."""
-    normalised = english_query.strip().lower()
+def get_cache_key(raw_message: str) -> str:
+    normalised = raw_message.strip().lower()
     return hashlib.sha256(normalised.encode()).hexdigest()[:16]
 
-def cache_get(english_query: str) -> Optional[str]:
-    """Return cached response if it exists, else None."""
-    return QUERY_CACHE.get(get_cache_key(english_query))
+def cache_get(raw_message: str) -> Optional[str]:
+    return QUERY_CACHE.get(get_cache_key(raw_message))
 
-def cache_set(english_query: str, response: str) -> None:
-    """Store response in cache. Evict oldest entry when cache is full."""
-    key = get_cache_key(english_query)
+def cache_set(raw_message: str, response: str) -> None:
+    key = get_cache_key(raw_message)
     if key in QUERY_CACHE:
-        return   # already cached, no-op
+        return
     if len(QUERY_CACHE) >= CACHE_MAX_SIZE:
-        # Evict the first (oldest) key
         oldest = next(iter(QUERY_CACHE))
         del QUERY_CACHE[oldest]
         print(f"🗑️ Cache evicted oldest entry (size was {CACHE_MAX_SIZE})")
@@ -211,55 +207,45 @@ def chat_pipeline(
     conversation_history: list,
     max_tokens: int = 600,
     is_voice: bool = False,
-    pre_fetched_context: Optional[str] = None   # passed in from voice parallel fetch
+    pre_fetched_context: Optional[str] = None
 ) -> tuple:
-    """
-    Core RAG logic shared by /chat and /ws/voice.
+    lang = "Bangla" if not is_english(user_message) else "English"
 
-    pre_fetched_context: if provided (voice path), skip retrieval entirely —
-    the context was already fetched in parallel with STT to save time.
-
-    Returns: (response_text, conversation_history, model_used)
-    """
-
-    # Step 1 — Language detection and translation
-    lang          = "Bangla" if not is_english(user_message) else "English"
-    english_query = translate_to_english(user_message)
-
-    # Step 2 — Cache check (text chat only, not voice)
-    # Voice turns are not cached because the same question mid-conversation
-    # may need a different answer depending on session history.
+    # Cache check (text chat only, not voice)
     if not is_voice and len(conversation_history) == 0:
-        cached = cache_get(english_query)
+        cached = cache_get(user_message)
         if cached:
-            print(f"⚡ Cache hit for: '{english_query[:50]}'")
+            print(f"⚡ Cache hit for: '{user_message[:50]}'")
             conversation_history.append({"role": "user",      "content": user_message})
             conversation_history.append({"role": "assistant", "content": cached})
             return cached, conversation_history, "cache"
 
-    # Step 3 — Retrieve relevant chunks
-    # If voice_server already fetched context in parallel, skip retrieval here.
+    # Retrieve relevant chunks
     if pre_fetched_context is not None:
         context = pre_fetched_context
-        print("⚡ Using pre-fetched context (parallel STT+retrieval)")
+        print("⚡ Using pre-fetched context")
     else:
-        docs    = retrieve(english_query)
+        docs    = retrieve(user_message)
         context = build_context(docs)
 
-    # Step 4 — Build messages
+    # Build messages
     system_instruction = SYSTEM_PROMPT + f"\n\nRELEVANT CONTEXT:\n{context}"
 
     if is_voice:
         system_instruction += (
-            "\n\n[VOICE CALL GUIDELINES: Keep your response natural, conversational, and concise. "
-            "Avoid bullet-point lists — speak in flowing sentences as a real assistant would. "
-            "Respond directly to the user's question. "
+            "\n\n[VOICE CALL GUIDELINES: Speak in natural, flowing sentences. "
+            "Do NOT cut responses short — always complete your full answer even if it is long. "
+            "If explaining a multi‑part topic like the NGO Health Protection System, "
+            "cover all parts completely before stopping. "
+            "Avoid bullet points — use natural speech instead. "
             "CRITICAL: Avoid grammatical spelling errors in Bangla. "
-            "Use standard, formal Bengali (প্রমিত বাংলা) with correct grammar and spelling.]"
+            "Use standard, formal Bengali (প্রমিত বাংলা) with correct grammar and spelling, "
+            "and address the caller formally using আপনি.]"
         )
 
     messages = [{"role": "system", "content": system_instruction}]
-    messages += conversation_history[-4:]
+    # Increased history window from -4 to -8 to reduce repetition
+    messages += conversation_history[-8:]
     messages.append({
         "role":    "user",
         "content": f"[Respond in {lang} only.]\n\n{user_message}"
@@ -292,8 +278,6 @@ def chat_pipeline(
             continue
 
     # ── If all Groq failed, try OpenAI gpt-4o-mini ───────────
-    # gpt-4o-mini: ~$0.15/1M input tokens, excellent quality,
-    # handles Bangla well, far better than any free OpenRouter model.
     if assistant_message is None and openai_client:
         print("⚠️ All Groq models exhausted — trying OpenAI gpt-4o-mini...")
         try:
@@ -314,17 +298,17 @@ def chat_pipeline(
         assistant_message = (
             "I'm experiencing high traffic right now. "
             "Please try again in a moment or contact us directly at "
-            "+8801805-464800 or info.belleviebd@gmail.com."
+            "01805464400 or info.belleviebd@gmail.com."
         )
         model_used = "fallback_message"
 
-    # Step 5 — Update history
+    # Update history
     conversation_history.append({"role": "user",      "content": user_message})
     conversation_history.append({"role": "assistant", "content": assistant_message})
 
-    # Step 6 — Cache the response for text chat (first-turn queries only)
+    # Cache the response for text chat (first-turn queries only)
     if not is_voice and len(conversation_history) == 2:
-        cache_set(english_query, assistant_message)
+        cache_set(user_message, assistant_message)
 
     return assistant_message, conversation_history, model_used
 
@@ -336,10 +320,11 @@ def root():
 @app.get("/health")
 def health():
     return {
-        "status":         "healthy",
-        "vectors_loaded": collection.count(),
-        "primary_model":  LLM_MODEL,
-        "cache_entries":  len(QUERY_CACHE),
+        "status":          "healthy",
+        "vectors_loaded":  collection.count(),
+        "primary_model":   LLM_MODEL,
+        "embedding_model": EMBEDDING_MODEL,
+        "cache_entries":   len(QUERY_CACHE),
     }
 
 @app.post("/chat", response_model=ChatResponse)
@@ -352,7 +337,6 @@ def chat_endpoint(request: ChatRequest):
         sessions[request.session_id],
         max_tokens=600,
         is_voice=False
-        # pre_fetched_context not passed — text chat does its own retrieval
     )
 
     sessions[request.session_id] = sessions[request.session_id][-20:]
